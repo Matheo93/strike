@@ -237,8 +237,9 @@ func (r *ProxyRotator) FilterAlive(timeout time.Duration) {
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
+			// Test against neutral endpoint (not the attack target)
 			start := time.Now()
-			conn, err := d.(proxy.ContextDialer).DialContext(ctx, "tcp", *target)
+			conn, err := d.(proxy.ContextDialer).DialContext(ctx, "tcp", "httpbin.org:443")
 			if err != nil {
 				return
 			}
