@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"flag"
 	"fmt"
@@ -187,12 +188,77 @@ func (r *ProxyRotator) refreshLoop(file string, interval time.Duration, stop <-c
 		select {
 		case <-t.C:
 			if err := r.loadFile(file); err == nil {
-				fmt.Fprintf(os.Stderr, "[strike] refreshed: %d proxies\n", len(r.proxies))
+				r.FilterAlive(8 * time.Second)
+				fmt.Fprintf(os.Stderr, "[strike] refreshed: %d proxies (%d alive)\n", len(r.proxies), r.CountAlive())
 			}
 		case <-stop:
 			return
 		}
 	}
+}
+
+func (r *ProxyRotator) CountAlive() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	count := 0
+	for _, p := range r.proxies {
+		if r.dead[p] < 3 {
+			count++
+		}
+	}
+	return count
+}
+
+func (r *ProxyRotator) FilterAlive(timeout time.Duration) {
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 50) // max 50 parallel checks
+	var mu sync.Mutex
+	var alive []string
+
+	r.mu.Lock()
+	proxies := make([]string, len(r.proxies))
+	copy(proxies, r.proxies)
+	r.mu.Unlock()
+
+	for _, p := range proxies {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(proxyURL string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			u, err := url.Parse(proxyURL)
+			if err != nil {
+				return
+			}
+			d, err := proxy.FromURL(u, &net.Dialer{Timeout: timeout})
+			if err != nil {
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+			start := time.Now()
+			conn, err := d.(proxy.ContextDialer).DialContext(ctx, "tcp", *target)
+			if err != nil {
+				return
+			}
+			latency := time.Since(start)
+			conn.Close()
+
+			if latency < 3*time.Second {
+				mu.Lock()
+				alive = append(alive, proxyURL)
+				mu.Unlock()
+			}
+		}(p)
+	}
+	wg.Wait()
+
+	r.mu.Lock()
+	r.proxies = alive
+	r.dead = make(map[string]int)
+	r.index = 0
+	r.mu.Unlock()
 }
 
 var globalRotator *ProxyRotator
@@ -248,6 +314,9 @@ func main() {
 			fmt.Fprintf(os.Stderr, "[strike] proxy-file error: %v\n", err)
 		} else {
 			globalRotator = rot
+			fmt.Fprintf(os.Stderr, "[strike] filtering proxies...\n")
+			rot.FilterAlive(8 * time.Second)
+			fmt.Fprintf(os.Stderr, "[strike] %d alive after filter\n", rot.CountAlive())
 			stop := make(chan struct{})
 			go rot.refreshLoop(*proxyFile, time.Duration(*proxyRefresh)*time.Second, stop)
 			defer close(stop)
