@@ -81,8 +81,10 @@ var (
 	duration  = flag.Int("duration", 900, "max duration (seconds)")
 	sni       = flag.String("sni", "", "TLS SNI (default: host from target)")
 	proxyURL  = flag.String("proxy", "", "SOCKS5 proxy (e.g. socks5://127.0.0.1:9050)")
-	proxyFile = flag.String("proxy-file", "", "file with SOCKS5 proxies (one per line, format: socks5://host:port)")
+	proxyFile    = flag.String("proxy-file", "", "file with SOCKS5 proxies (one per line)")
 	proxyRefresh = flag.Int("proxy-refresh", 300, "refresh proxy list every N seconds")
+	torCircuits  = flag.Int("tor-circuits", 0, "auto-generate N Tor circuits (uses -tor-proxy as base)")
+	torProxy     = flag.String("tor-proxy", "127.0.0.1:9050", "Tor SOCKS5 proxy address")
 
 	connects  uint64
 	disconns  uint64
@@ -307,6 +309,20 @@ func main() {
 	}
 
 	deadline := time.Now().Add(time.Duration(*duration) * time.Second)
+
+	// Auto-generate Tor circuits if -tor-circuits is set
+	if *torCircuits > 0 && *proxyFile == "" {
+		f, err := os.CreateTemp("", "tor-proxies-*.txt")
+		if err == nil {
+			for i := 1; i <= *torCircuits; i++ {
+				fmt.Fprintf(f, "socks5://user%d:pass@%s\n", i, *torProxy)
+			}
+			f.Close()
+			*proxyFile = f.Name()
+			defer os.Remove(f.Name())
+			fmt.Fprintf(os.Stderr, "[strike] generated %d Tor circuits\n", *torCircuits)
+		}
+	}
 
 	// Initialize proxy rotator if -proxy-file is set
 	if *proxyFile != "" {
